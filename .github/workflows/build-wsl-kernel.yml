@@ -1,0 +1,121 @@
+name: build-wsl-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "WSL2 kernel Git ref (branch or tag), e.g. linux-msft-wsl-6.6.y or a release tag"
+        required: true
+        default: "linux-msft-wsl-6.6.y"
+      config_path:
+        description: "Kernel config file (x86_64 default is Microsoft/config-wsl)"
+        required: true
+        default: "Microsoft/config-wsl"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Microsoft WSL2 kernel
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/WSL2-Linux-Kernel
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential flex bison dwarves pahole libssl-dev libelf-dev cpio qemu-utils \
+            bc rsync fakeroot dpkg-dev python3 ca-certificates
+
+      - name: Build kernel, modules, UAPI headers
+        working-directory: kernel
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          set -euo pipefail
+          # Build with Microsoft’s WSL config
+          make -j"$(nproc)" KCONFIG_CONFIG="$CONFIG_PATH"
+          # Install modules into a staging dir for VHDX generation
+          make INSTALL_MOD_PATH="$PWD/out/modules" modules_install
+          # Export UAPI headers (not the same as the linux-headers package)
+          make INSTALL_HDR_PATH="$PWD/out/headers-uapi" headers_install
+          # Capture the exact kernel release string
+          KREL="$(make -s kernelrelease)"
+          echo "KREL=$KREL" | tee -a "$GITHUB_ENV"
+
+          mkdir -p out
+          cp vmlinux "out/vmlinux-${KREL}"
+          cp System.map "out/System.map-${KREL}"
+          cp .config "out/config-${KREL}"
+          # Provide bzImage as well; some users prefer pointing .wslconfig to bzImage
+          if [ -f arch/x86/boot/bzImage ]; then cp arch/x86/boot/bzImage "out/bzImage-${KREL}"; fi
+
+      - name: Package modules as VHDX for .wslconfig
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          sudo ./Microsoft/scripts/gen_modules_vhdx.sh "$PWD/out/modules" "$KREL" "$PWD/out/modules-${KREL}.vhdx"
+
+      - name: Build Debian packages (headers and image)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          # Produces linux-headers-*.deb and linux-image-*.deb matching the same kernelrelease
+          make -j"$(nproc)" bindeb-pkg
+          mkdir -p out/debs
+          # Move generated .deb files from parent directory into out/debs
+          shopt -s nullglob
+          mv ../linux-* out/debs/
+
+      - name: Create UAPI headers tarball (optional)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          tar -C out/headers-uapi -czf "out/linux-uapi-headers-${KREL}.tar.gz" include
+
+      - name: Checksums
+        working-directory: kernel/out
+        run: |
+          set -euo pipefail
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-kernel-${{ env.KREL }}
+          path: |
+            kernel/out/vmlinux-*
+            kernel/out/bzImage-*
+            kernel/out/System.map-*
+            kernel/out/config-*
+            kernel/out/modules-*.vhdx
+            kernel/out/debs/*
+            kernel/out/linux-uapi-headers-*.tar.gz
+            kernel/out/SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kernel/out/vmlinux-*
+            kernel/out/bzImage-*
+            kernel/out/System.map-*
+            kernel/out/config-*
+            kernel/out/modules-*.vhdx
+            kernel/out/debs/*
+            kernel/out/linux-uapi-headers-*.tar.gz
+            kernel/out/SHA256SUMS.txt
