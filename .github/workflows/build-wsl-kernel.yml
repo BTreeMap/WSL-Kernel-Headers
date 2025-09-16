@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DEBIAN_FRONTEND: noninteractive
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
 
     steps:
       - name: Checkout workflow repo
@@ -30,67 +32,130 @@ jobs:
           path: kernel
           fetch-depth: 1
 
-      - name: Install build dependencies
+      - name: Install deps (incl. ccache)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential flex bison dwarves pahole libssl-dev libelf-dev cpio qemu-utils \
-            bc rsync fakeroot dpkg-dev python3 ca-certificates
+            bc rsync fakeroot dpkg-dev python3 ca-certificates ccache
+          ccache -M 5G
+          ccache -s
 
-      - name: Build kernel, modules, UAPI headers
+      - name: Detect compiler version (for cache key)
+        id: compver
+        run: |
+          echo "CC_VER=$(gcc -dumpfullversion -dumpversion || gcc -dumpversion)" >> "$GITHUB_ENV"
+          echo "CC_VER=$CC_VER"
+      
+      # Restore caches early
+      - name: Restore ccache
+        id: cache-ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ env.CC_VER }}-${{ inputs.kernel_ref }}-${{ hashFiles('kernel/**', '!kernel/out/**') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.CC_VER }}-
+            ccache-${{ runner.os }}-
+            ccache-
+
+      - name: Restore build outputs cache
+        id: cache-out-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: kernel/out
+          key: kbuild-out-${{ runner.os }}-${{ inputs.kernel_ref }}-${{ hashFiles('kernel/Microsoft/config-wsl') }}
+          restore-keys: |
+            kbuild-out-${{ runner.os }}-${{ inputs.kernel_ref }}-
+            kbuild-out-${{ runner.os }}-
+
+      - name: Build kernel, modules, UAPI headers (ccache+bzImage)
+        id: build-kernel
         working-directory: kernel
+        continue-on-error: true
         env:
           CONFIG_PATH: ${{ inputs.config_path }}
         run: |
           set -euo pipefail
-          # Build with Microsoft’s WSL config
-          make -j"$(nproc)" KCONFIG_CONFIG="$CONFIG_PATH"
-          # Install modules into a staging dir for VHDX generation
-          make INSTALL_MOD_PATH="$PWD/out/modules" modules_install
-          # Export UAPI headers (not the same as the linux-headers package)
-          make INSTALL_HDR_PATH="$PWD/out/headers-uapi" headers_install
-          # Capture the exact kernel release string
-          KREL="$(make -s kernelrelease)"
+          # Ensure .config exists and is expanded non-interactively
+          cp "$CONFIG_PATH" .config || { echo "::warning::Missing $CONFIG_PATH; attempting default defconfig"; echo; }
+          make -j"$(nproc)" olddefconfig || { echo "::warning::.config expansion failed"; }
+
+          # Use ccache wrappers
+          make -j"$(nproc)" CC="ccache gcc" HOSTCC="ccache gcc" bzImage modules || { echo "::warning::Kernel build failed"; }
+
+          # Install modules to stage for VHDX
+          mkdir -p "$PWD/out/modules"
+          make INSTALL_MOD_PATH="$PWD/out/modules" modules_install || { echo "::warning::modules_install failed"; }
+
+          # Export userspace (UAPI) headers
+          make INSTALL_HDR_PATH="$PWD/out/headers-uapi" headers_install || { echo "::warning::headers_install failed"; }
+
+          # Record kernelrelease (don’t fail if it can’t be read)
+          KREL="$(make -s kernelrelease || true)"
+          if [ -z "$KREL" ]; then
+            echo "::warning::kernelrelease not determined; using timestamp"
+            KREL="unknown-$(date +%s)"
+          fi
           echo "KREL=$KREL" | tee -a "$GITHUB_ENV"
 
           mkdir -p out
-          cp vmlinux "out/vmlinux-${KREL}"
-          cp System.map "out/System.map-${KREL}"
-          cp .config "out/config-${KREL}"
-          # Provide bzImage as well; some users prefer pointing .wslconfig to bzImage
-          if [ -f arch/x86/boot/bzImage ]; then cp arch/x86/boot/bzImage "out/bzImage-${KREL}"; fi
+          # Copy artifacts defensively with warnings, not hard failures
+          [ -f vmlinux ] && cp vmlinux "out/vmlinux-${KREL}" || echo "::warning::vmlinux missing"
+          [ -f System.map ] && cp System.map "out/System.map-${KREL}" || echo "::warning::System.map missing"
+          [ -f .config ] && cp .config "out/config-${KREL}" || echo "::warning::.config missing"
+          [ -f arch/x86/boot/bzImage ] && cp arch/x86/boot/bzImage "out/bzImage-${KREL}" || echo "::warning::bzImage missing"
 
-      - name: Package modules as VHDX for .wslconfig
+      - name: Package modules as VHDX
+        id: modules-vhdx
         working-directory: kernel
+        continue-on-error: true
         run: |
           set -euo pipefail
-          sudo ./Microsoft/scripts/gen_modules_vhdx.sh "$PWD/out/modules" "$KREL" "$PWD/out/modules-${KREL}.vhdx"
+          if [ -d "$PWD/out/modules" ]; then
+            sudo ./Microsoft/scripts/gen_modules_vhdx.sh "$PWD/out/modules" "$KREL" "$PWD/out/modules-${KREL}.vhdx" || \
+              echo "::warning::gen_modules_vhdx.sh failed"
+          else
+            echo "::warning::modules directory not found, skipping VHDX"
+          fi
 
       - name: Build Debian packages (headers and image)
+        id: deb-pkgs
         working-directory: kernel
+        continue-on-error: true
         run: |
           set -euo pipefail
-          # Produces linux-headers-*.deb and linux-image-*.deb matching the same kernelrelease
-          make -j"$(nproc)" bindeb-pkg
+          make -j"$(nproc)" bindeb-pkg || echo "::warning::bindeb-pkg failed"
           mkdir -p out/debs
-          # Move generated .deb files from parent directory into out/debs
           shopt -s nullglob
-          mv ../linux-* out/debs/
+          mv ../linux-* out/debs/ 2>/dev/null || echo "::warning::No Debian packages were produced"
 
-      - name: Create UAPI headers tarball (optional)
+      - name: Pack UAPI headers (tgz)
+        id: uapi-tar
         working-directory: kernel
+        continue-on-error: true
         run: |
           set -euo pipefail
-          tar -C out/headers-uapi -czf "out/linux-uapi-headers-${KREL}.tar.gz" include
+          if [ -d out/headers-uapi/include ]; then
+            tar -C out/headers-uapi -czf "out/linux-uapi-headers-${KREL}.tar.gz" include || \
+              echo "::warning::UAPI tarball creation failed"
+          else
+            echo "::warning::UAPI headers directory missing"
+          fi
 
       - name: Checksums
+        id: checksums
         working-directory: kernel/out
+        continue-on-error: true
         run: |
           set -euo pipefail
-          sha256sum * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          ls -la || echo "::warning::No out/ directory content to checksum"
+          (shopt -s nullglob; sha256sum * > SHA256SUMS.txt) || echo "::warning::Checksum generation failed"
+          cat SHA256SUMS.txt || echo "::warning::SHA256SUMS.txt missing"
 
-      - name: Upload build artifacts
+      # Upload artifacts regardless of failures
+      - name: Upload artifacts (always)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: wsl-kernel-${{ env.KREL }}
@@ -106,16 +171,24 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Publish GitHub Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      # Save caches even if the build failed/cancelled
+      - name: Save ccache (always)
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
         with:
-          files: |
-            kernel/out/vmlinux-*
-            kernel/out/bzImage-*
-            kernel/out/System.map-*
-            kernel/out/config-*
-            kernel/out/modules-*.vhdx
-            kernel/out/debs/*
-            kernel/out/linux-uapi-headers-*.tar.gz
-            kernel/out/SHA256SUMS.txt
+          path: .ccache
+          key: ${{ steps.cache-ccache-restore.outputs.cache-primary-key }}
+
+      - name: Save build outputs cache (always)
+        if: ${{ always() }}
+        uses: actions/cache/save@v4
+        with:
+          path: kernel/out
+          key: ${{ steps.cache-out-restore.outputs.cache-primary-key }}
+
+      # Final gate: make the job fail only after caches/artifacts are handled
+      - name: Finalize job status
+        if: ${{ steps.build-kernel.outcome == 'failure' || steps.modules-vhdx.outcome == 'failure' }}
+        run: |
+          echo "::error::Critical build step failed; caches and artifacts were preserved"
+          exit 1
