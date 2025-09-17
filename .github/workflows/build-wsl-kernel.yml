@@ -34,13 +34,35 @@ jobs:
           path: kernel
           fetch-depth: 1
 
+      - name: Enable deb-src and install kernel build-deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /etc/os-release
+
+          # Enable deb-src (deb822 format on modern Ubuntu)
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            # Add 'deb-src' to all Types: lines if missing
+            if ! grep -q '^Types:.*deb-src' /etc/apt/sources.list.d/ubuntu.sources; then
+              sudo sed -i 's/^Types: *deb\( .* \)\?$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+          else
+            # Fallback: add classic deb-src entries
+            sudo add-apt-repository -y "deb-src http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME} main restricted universe multiverse"
+            sudo add-apt-repository -y "deb-src http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-updates main restricted universe multiverse"
+            sudo add-apt-repository -y "deb-src http://security.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse"
+          fi
+
+          # Update and install build-deps for 'linux'
+          sudo apt-get update
+          sudo apt-get -y build-dep linux
+
       - name: Install deps (incl. ccache)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential flex bison dwarves pahole libssl-dev libelf-dev cpio qemu-utils \
             bc rsync fakeroot dpkg-dev python3 ca-certificates ccache debhelper xz-utils
-          sudo apt-get build-dep linux
           ccache -M 5G
           ccache -s
 
