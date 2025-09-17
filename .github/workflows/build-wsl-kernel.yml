@@ -150,7 +150,8 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          make -j"$(nproc)" bindeb-pkg || echo "::warning::bindeb-pkg failed"
+          # Build everything including packaging to reuse objects and avoid recompilation
+          make -j"$(nproc)" CC="ccache gcc" HOSTCC="ccache gcc" bindeb-pkg || echo "::warning::bindeb-pkg failed"
           mkdir -p out/debs
           shopt -s nullglob
           mv ../linux-* out/debs/ 2>/dev/null || echo "::warning::No Debian packages were produced"
