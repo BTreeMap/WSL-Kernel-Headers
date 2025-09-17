@@ -34,6 +34,20 @@ jobs:
           path: kernel
           fetch-depth: 1
 
+      - name: Patch deb packaging to lowercase names (WSL-safe)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          # builddeb: use lowercased version for packagename
+          sed -i 's/^version=\$KERNELRELEASE$/version=$KERNELRELEASE\npkgversion=$(echo $KERNELRELEASE | tr "[:upper:]" "[:lower:]")/' scripts/package/builddeb
+          sed -i 's/^packagename=linux-image-\$version$/packagename=linux-image-$pkgversion/' scripts/package/builddeb
+          sed -i 's/user-mode-linux-\$version/user-mode-linux-$pkgversion/' scripts/package/builddeb
+          sed -i 's/create_package linux-headers-\$version/create_package linux-headers-$pkgversion/' scripts/package/builddeb
+      
+          # mkdebian: keep original KERNELRELEASE for building, but use lowercased for Debian metadata
+          sed -i 's/^version=\$KERNELRELEASE$/version=$(echo $KERNELRELEASE | tr "[:upper:]" "[:lower:]")\nmkversion=$KERNELRELEASE/' scripts/package/mkdebian
+          sed -i 's/KERNELRELEASE=\${version}/KERNELRELEASE=${mkversion}/g' scripts/package/mkdebian
+
       - name: Enable deb-src and install kernel build-deps
         shell: bash
         run: |
