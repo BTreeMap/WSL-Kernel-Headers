@@ -36,17 +36,50 @@ jobs:
 
       - name: Patch deb packaging to lowercase names (WSL-safe)
         working-directory: kernel
+        shell: bash
         run: |
           set -euo pipefail
-          # builddeb: use lowercased version for packagename
-          sed -i 's/^version=\$KERNELRELEASE$/version=$KERNELRELEASE\npkgversion=$(echo $KERNELRELEASE | tr "[:upper:]" "[:lower:]")/' scripts/package/builddeb
-          sed -i 's/^packagename=linux-image-\$version$/packagename=linux-image-$pkgversion/' scripts/package/builddeb
-          sed -i 's/user-mode-linux-\$version/user-mode-linux-$pkgversion/' scripts/package/builddeb
-          sed -i 's/create_package linux-headers-\$version/create_package linux-headers-$pkgversion/' scripts/package/builddeb
-      
-          # mkdebian: keep original KERNELRELEASE for building, but use lowercased for Debian metadata
-          sed -i 's/^version=\$KERNELRELEASE$/version=$(echo $KERNELRELEASE | tr "[:upper:]" "[:lower:]")\nmkversion=$KERNELRELEASE/' scripts/package/mkdebian
-          sed -i 's/KERNELRELEASE=\${version}/KERNELRELEASE=${mkversion}/g' scripts/package/mkdebian
+
+          bd="scripts/package/builddeb"
+          md="scripts/package/mkdebian"
+
+          # ── builddeb ────────────────────────────────────────────────────────────
+          if [ -f "$bd" ]; then
+            # Define pkgversion = lowercase($version) right after version=$KERNELRELEASE
+            if grep -q '^version=\$KERNELRELEASE$' "$bd"; then
+              sed -i '/^version=\$KERNELRELEASE$/a pkgversion=$(echo "$version" | tr "[:upper:]" "[:lower:]")' "$bd"
+            fi
+
+            # Use $pkgversion ONLY for Debian package names; keep install paths on $version
+            # Handle common patterns for package name assignments and create_package calls
+            sed -i \
+              -e 's/\<packagename=linux-image-\$version\>/packagename=linux-image-$pkgversion/g' \
+              -e 's/\<packagename=user-mode-linux-\$version\>/packagename=user-mode-linux-$pkgversion/g' \
+              -e 's/\<packagename=linux-headers-\$version\>/packagename=linux-headers-$pkgversion/g' \
+              -e 's/\<create_package linux-image-\$version\>/create_package linux-image-$pkgversion/g' \
+              -e 's/\<create_package user-mode-linux-\$version\>/create_package user-mode-linux-$pkgversion/g' \
+              -e 's/\<create_package linux-headers-\$version\>/create_package linux-headers-$pkgversion/g' \
+              "$bd" || true
+
+            # Do NOT touch hdrdir=/usr/src/linux-headers-$version or /lib/modules/$version/build symlink
+            # so that $(uname -r) with uppercase WSL2+ maps to the installed headers path.
+          fi
+
+          # ── mkdebian ────────────────────────────────────────────────────────────
+          if [ -f "$md" ]; then
+            # Define pkgversion = lowercase($version) after version=$KERNELRELEASE in mkdebian too
+            if grep -q '^version=\$KERNELRELEASE$' "$md"; then
+              sed -i '/^version=\$KERNELRELEASE$/a pkgversion=$(echo "$version" | tr "[:upper:]" "[:lower:]")' "$md"
+            fi
+
+            # Switch Debian metadata that embeds linux-*-<version> to use $pkgversion
+            # (mkdebian generates debian/control/changelog stanzas)
+            sed -i \
+              -e 's/linux-image-\$version/linux-image-$pkgversion/g' \
+              -e 's/user-mode-linux-\$version/user-mode-linux-$pkgversion/g' \
+              -e 's/linux-headers-\$version/linux-headers-$pkgversion/g' \
+              "$md" || true
+          fi
 
       - name: Enable deb-src and install kernel build-deps
         shell: bash
