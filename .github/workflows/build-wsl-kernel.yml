@@ -186,6 +186,55 @@ jobs:
           path: kernel/out
           key: ${{ steps.cache-out-restore.outputs.cache-primary-key }}
 
+      - name: Compress large VHDX for release
+        if: ${{ always() }}
+        working-directory: kernel/out
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in modules-*.vhdx; do
+            # Compress with xz to keep a single asset well under the 2 GiB release limit
+            xz -T0 -6 -v -k "$f" || echo "::warning::Compression failed for $f"
+          done
+
+      - name: Compute build number and tag (yyyy-mm-dd-buildNumber)
+        id: ver
+        shell: bash
+        env:
+          BASE: ${{ inputs.base }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          DATE="$(date -u +%Y-%m-%d)"
+          # bn = base + run_id
+          BN="$(( ${BASE:-0} + ${RUN_ID:-0} ))"
+          echo "BUILD_NUMBER=$BN" | tee -a "$GITHUB_ENV"
+          TAG="${DATE}-${BN}"
+          echo "TAG=$TAG" | tee -a "$GITHUB_ENV"
+          echo "build_number=$BN" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create/Update GitHub Release (mark latest)
+        if: ${{ always() }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          make_latest: true
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            kernel/out/vmlinux-*
+            kernel/out/bzImage-*
+            kernel/out/System.map-*
+            kernel/out/config-*
+            kernel/out/modules-*.vhdx.xz
+            kernel/out/debs/*
+            kernel/out/linux-uapi-headers-*.tar.gz
+            kernel/out/SHA256SUMS.txt
+
       # Final gate: make the job fail only after caches/artifacts are handled
       - name: Finalize job status
         if: ${{ steps.build-kernel.outcome == 'failure' || steps.modules-vhdx.outcome == 'failure' }}
