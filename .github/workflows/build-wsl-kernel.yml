@@ -39,47 +39,55 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           bd="scripts/package/builddeb"
           md="scripts/package/mkdebian"
 
-          # ── builddeb ────────────────────────────────────────────────────────────
-          if [ -f "$bd" ]; then
-            # Define pkgversion = lowercase($version) right after version=$KERNELRELEASE
-            if grep -q '^version=\$KERNELRELEASE$' "$bd"; then
-              sed -i '/^version=\$KERNELRELEASE$/a pkgversion=$(echo "$version" | tr "[:upper:]" "[:lower:]")' "$bd"
-            fi
+          echo "Patching $bd and $md (if present) to lowercase Debian package names only..."
 
-            # Use $pkgversion ONLY for Debian package names; keep install paths on $version
-            # Handle common patterns for package name assignments and create_package calls
-            sed -i \
-              -e 's/\<packagename=linux-image-\$version\>/packagename=linux-image-$pkgversion/g' \
-              -e 's/\<packagename=user-mode-linux-\$version\>/packagename=user-mode-linux-$pkgversion/g' \
-              -e 's/\<packagename=linux-headers-\$version\>/packagename=linux-headers-$pkgversion/g' \
-              -e 's/\<create_package linux-image-\$version\>/create_package linux-image-$pkgversion/g' \
-              -e 's/\<create_package user-mode-linux-\$version\>/create_package user-mode-linux-$pkgversion/g' \
-              -e 's/\<create_package linux-headers-\$version\>/create_package linux-headers-$pkgversion/g' \
-              "$bd" || true
+          patch_pkg_names() {
+            local f="$1"
+            [ -f "$f" ] || { echo "Skipping $f (not present)"; return 0; }
 
-            # Do NOT touch hdrdir=/usr/src/linux-headers-$version or /lib/modules/$version/build symlink
-            # so that $(uname -r) with uppercase WSL2+ maps to the installed headers path.
-          fi
+            # 1) Ensure version=$KERNELRELEASE remains intact, then define pkgversion=lowercase($version)
+            #    Insert pkgversion line immediately after the first assignment that references KERNELRELEASE.
+            awk '
+              BEGIN { inserted=0 }
+              {
+                print $0
+                if (!inserted && $0 ~ /version=.*KERNELRELEASE/) {
+                  print "pkgversion=$(echo \"$version\" | tr \"[:upper:]\" \"[:lower:]\")"
+                  inserted=1
+                }
+              }
+            ' "$f" > "$f.tmp1"
 
-          # ── mkdebian ────────────────────────────────────────────────────────────
-          if [ -f "$md" ]; then
-            # Define pkgversion = lowercase($version) after version=$KERNELRELEASE in mkdebian too
-            if grep -q '^version=\$KERNELRELEASE$' "$md"; then
-              sed -i '/^version=\$KERNELRELEASE$/a pkgversion=$(echo "$version" | tr "[:upper:]" "[:lower:]")' "$md"
-            fi
+            # 2) Rewrite ONLY Debian package names to use $pkgversion, never the filesystem paths.
+            #    Skip lines that refer to /usr/src or /lib/modules to keep install paths/symlinks on $version.
+            awk '
+              {
+                line = $0
+                if (line ~ /\/usr\/src|\/lib\/modules/) {
+                  print line
+                } else {
+                  gsub(/linux-headers-\$version/, "linux-headers-\\$pkgversion", line)
+                  gsub(/linux-image-\$version/,   "linux-image-\\$pkgversion",   line)
+                  print line
+                }
+              }
+            ' "$f.tmp1" > "$f.tmp2"
 
-            # Switch Debian metadata that embeds linux-*-<version> to use $pkgversion
-            # (mkdebian generates debian/control/changelog stanzas)
-            sed -i \
-              -e 's/linux-image-\$version/linux-image-$pkgversion/g' \
-              -e 's/user-mode-linux-\$version/user-mode-linux-$pkgversion/g' \
-              -e 's/linux-headers-\$version/linux-headers-$pkgversion/g' \
-              "$md" || true
-          fi
+            # 3) Replace the original file atomically
+            mv "$f.tmp2" "$f"
+            rm -f "$f.tmp1"
+
+            # 4) Show the lines we touched for debugging
+            echo "==== After patch ($f) – key lines ===="
+            grep -nE 'version=.*KERNELRELEASE|pkgversion=|linux-(image|headers)-' "$f" || true
+            echo "======================================="
+          }
+
+          patch_pkg_names "$bd"
+          patch_pkg_names "$md"
 
       - name: Enable deb-src and install kernel build-deps
         shell: bash
